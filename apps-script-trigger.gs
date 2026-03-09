@@ -1,120 +1,176 @@
-/**
- * YouTube Bulk Uploader - Apps Script Trigger
- * 
- * This script allows you to manually trigger the YouTube Bulk Uploader
- * Cloud Function from your Google Spreadsheet.
- * 
- * Setup Instructions:
- * 1. Open your Google Spreadsheet
- * 2. Go to Extensions > Apps Script
- * 3. Replace the default code with this script
- * 4. Update the CLOUD_FUNCTION_URL constant below with your function URL
- * 5. Save and refresh your spreadsheet
- * 6. You'll see a new menu "YouTube Uploader" with options to trigger uploads
- */
+// Note: Apps Script automatically requests authorization
+// based on the API's used in the code.
 
-// ============================================================================
-// CONFIGURATION - Update this with your Cloud Function URL
-// ============================================================================
-const CLOUD_FUNCTION_URL = 'YOUR_CLOUD_FUNCTION_URL_HERE';
-// Example: 'https://us-east1-your-project.cloudfunctions.net/youtube-bulk-uploader'
+const CHANNEL_VIDEOS_SHEET_NAME = "Channel Videos List";
+const CHANNEL_VIDEOS_SHEET_HEADER = ["Video Title", "Video ID", "Video Description", "Thumbnail", "Video URL"];
+const FILE_UPLOAD_LIST_SHEET_NAME = "File Upload List";
+const FILE_UPLOAD_LIST_SHEET_HEADER = ["File Name", "File ID", "Title", "Description", "Tags", "Self Declared Made For Kids", "YouTube URL"];
+const CLOUD_FUNCTION_URL = 'https://us-east1-thrive-alo.cloudfunctions.net/youtube-bulk-uploader';
+const ONBOARDING_FUNCTION_URL = 'https://us-east1-thrive-alo.cloudfunctions.net/youtube-bulk-uploader-onboarding';
 
-// Get config values from the spreadsheet
-const SPREADSHEET = SpreadsheetApp.getActive();
-const DRIVE_FOLDER_ID = '1cMlIsNLn7KoaMjHEZYjn8pavtQF43xAM';
-const YOUTUBE_CHANNEL_ID = 'UCDhxapLoA0eGl7PJa4ZtTiw';
-
-// ============================================================================
-// MENU FUNCTIONS
-// ============================================================================
-
-/**
- * Creates a custom menu in the spreadsheet when opened
- */
-function onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  ui.createMenu('YouTube Uploader')
-      .addItem('🚀 Upload Videos Now', 'triggerUpload')
-      .addSeparator()
-      .addItem('📊 Check Function Status', 'checkFunctionStatus')
-      .addItem('⚙️ Configure Function URL', 'promptForFunctionUrl')
-      .addSeparator()
-      .addItem('ℹ️ Help', 'showHelp')
-      .addToUi();
+function getConfigValues_() {
+  const ss = SpreadsheetApp.getActive();
+  return {
+    channelId: String(ss.getRange("Config!B3").getValue() || '').trim(),
+    driveFolderId: String(ss.getRange("Config!B4").getValue() || '').trim(),
+    completedFolderId: String(ss.getRange("Config!B6").getValue() || '').trim(),
+    defaultDescription: String(ss.getRange("Config!B2").getValue() || ''),
+    postUploadAction: String(ss.getRange("Config!B5").getValue() || '').trim()
+  };
 }
 
-// ============================================================================
-// MAIN TRIGGER FUNCTION
-// ============================================================================
 
-/**
- * Triggers the YouTube Bulk Uploader Cloud Function
- */
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('YouTube Bulk Uploader')
+
+    .addItem('List Videos From Google Drive', 'pullFilesFromRootFolder')
+    .addSeparator()
+    .addItem('Upload To Youtube', 'triggerUpload')
+    .addSeparator()
+    .addItem('Client Onboarding (One Click)', 'runClientOnboarding')
+    .addSeparator()
+    .addItem('List Uploaded Videos', 'listMyUploads')
+    .addToUi();
+}
+
+function callCloudFunction_(url, payload) {
+  var token = ScriptApp.getIdentityToken();
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+    headers: {
+      Authorization: 'Bearer ' + token
+    }
+  };
+  return UrlFetchApp.fetch(url, options);
+}
+
+function listMyUploads() {
+  Logger.log("inside listMyUploads")
+  var ui = SpreadsheetApp.getUi();
+  var cfg = getConfigValues_();
+  var channelID = cfg.channelId;
+  var sheet = SpreadsheetApp.getActive().getSheetByName(CHANNEL_VIDEOS_SHEET_NAME);
+  var valuesForSheet = []; //File array to be written to sheet in the end
+  valuesForSheet.push(CHANNEL_VIDEOS_SHEET_HEADER);
+
+  try {
+    var channelParams = channelID ? { id: channelID } : { mine: true };
+    var results = YouTube.Channels.list('contentDetails,snippet', channelParams);
+
+    if (!results.items || results.items.length === 0) {
+      ui.alert(
+        'Channel not found',
+        'No YouTube channel was found for Config!B3. Use the real Channel ID (starts with "UC"), not @handle or channel URL.',
+        ui.ButtonSet.OK
+      );
+      return;
+    }
+
+    var targetChannelId = channelID || results.items[0].id;
+    var nextPageToken = '';
+    while (nextPageToken != null) {
+      var searchResponse = YouTube.Search.list('id,snippet', {
+        channelId: targetChannelId,
+        maxResults: 50,
+        order: 'date',
+        type: 'video',
+        pageToken: nextPageToken
+      });
+
+      var searchItems = searchResponse.items || [];
+      for (var i = 0; i < searchItems.length; i++) {
+        var searchItem = searchItems[i];
+        if (!searchItem.id || !searchItem.id.videoId) {
+          continue;
+        }
+
+        valuesForSheet.push([
+          searchItem.snippet.title,
+          searchItem.id.videoId,
+          searchItem.snippet.description,
+          "=IMAGE(\"" + searchItem.snippet.thumbnails.default.url + "\")",
+          "https://www.youtube.com/watch?v=" + searchItem.id.videoId
+        ]);
+      }
+      nextPageToken = searchResponse.nextPageToken;
+    }
+
+    sheet.clearContents();
+    var lastRow = sheet.getLastRow();
+    var range = sheet.getRange(lastRow + 1, 1, valuesForSheet.length, 5);
+    range.setValues(valuesForSheet);
+  } catch (error) {
+    Logger.log('listMyUploads error: ' + error);
+    ui.alert(
+      'Failed to list uploads',
+      'YouTube returned: ' + error.message + '\n\nMost common cause: Config!B3 is not a valid Channel ID for an accessible channel. Use a channel ID that starts with "UC".',
+      ui.ButtonSet.OK
+    );
+  }
+}
+
 function triggerUpload() {
   const ui = SpreadsheetApp.getUi();
-  
-  // Validate configuration
-  if (!CLOUD_FUNCTION_URL || CLOUD_FUNCTION_URL === 'YOUR_CLOUD_FUNCTION_URL_HERE') {
+  const cfg = getConfigValues_();
+
+  if (!cfg.driveFolderId || !cfg.channelId) {
     ui.alert(
-      '⚠️ Configuration Required',
-      'Please configure the Cloud Function URL first.\n\n' +
-      'Go to: YouTube Uploader > Configure Function URL',
+      '❌ Missing configuration',
+      'Please ensure Config!B3 (YouTube Channel ID) and Config!B4 (Drive Root Folder ID) are filled in.',
       ui.ButtonSet.OK
     );
     return;
   }
-  
+
   // Confirm action
   const response = ui.alert(
-    '🚀 Trigger YouTube Upload',
+    'YouTube videos upload',
     'This will start uploading videos from your Google Drive folder to YouTube.\n\n' +
     'Continue?',
     ui.ButtonSet.YES_NO
   );
-  
+
   if (response !== ui.Button.YES) {
     return;
   }
-  
+
   // Show progress
   const progressMsg = ui.alert(
     '⏳ Processing...',
-    'Triggering the upload function. This may take a few moments...',
+    'Uploading video. This may take a few minutes to complete...',
     ui.ButtonSet.OK
   );
-  
+
   try {
     // Prepare request payload
     const payload = {
-      drive_root_folder_id: DRIVE_FOLDER_ID,
-      youtube_channel_id: YOUTUBE_CHANNEL_ID,
-      spreadsheet_id: SPREADSHEET.getId()
+      drive_root_folder_id: cfg.driveFolderId,
+      youtube_channel_id: cfg.channelId,
+      default_video_description: cfg.defaultDescription,
+      post_upload_action: cfg.postUploadAction,
+      completed_folder_id: cfg.completedFolderId
     };
-    
-    // Make HTTP request to Cloud Function
-    const options = {
-      method: 'post',
-      contentType: 'application/json',
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    };
-    
+
     Logger.log('Triggering Cloud Function: ' + CLOUD_FUNCTION_URL);
     Logger.log('Payload: ' + JSON.stringify(payload));
-    
-    const httpResponse = UrlFetchApp.fetch(CLOUD_FUNCTION_URL, options);
-    const statusCode = httpResponse.getResponseCode();
-    const responseText = httpResponse.getContentText();
-    
+
+    var httpResponse = callCloudFunction_(CLOUD_FUNCTION_URL, payload);
+    var statusCode = httpResponse.getResponseCode();
+    var responseText = httpResponse.getContentText();
+
     Logger.log('Response Status: ' + statusCode);
     Logger.log('Response Body: ' + responseText);
-    
+
     // Handle response
     if (statusCode === 200) {
-      let resultMessage = '✅ Upload triggered successfully!\n\n';
-      
+      var resultMessage = '🥳 Upload was success!\n\n';
+
       try {
-        const result = JSON.parse(responseText);
+        var result = JSON.parse(responseText);
         if (result.result) {
           resultMessage += 'Result: ' + result.result + '\n\n';
         }
@@ -122,224 +178,184 @@ function triggerUpload() {
       } catch (e) {
         resultMessage += 'Response: ' + responseText;
       }
-      
+
       ui.alert('Success', resultMessage, ui.ButtonSet.OK);
-      
-      // Refresh the logs sheet if it exists
-      refreshLogsSheet();
-      
+
     } else {
       ui.alert(
         '❌ Error',
-        'Failed to trigger upload.\n\n' +
+        'Failed to upload.\n\n' +
         'Status Code: ' + statusCode + '\n' +
         'Response: ' + responseText.substring(0, 500),
         ui.ButtonSet.OK
       );
     }
-    
+
   } catch (error) {
     Logger.log('Error triggering function: ' + error);
     ui.alert(
       '❌ Error',
       'Failed to trigger the upload function.\n\n' +
       'Error: ' + error.message + '\n\n' +
-      'Please check:\n' +
-      '1. Cloud Function URL is correct\n' +
-      '2. Function is deployed and accessible\n' +
-      '3. You have internet connectivity',
+      'Please contact Thrive Digital',
       ui.ButtonSet.OK
     );
   }
 }
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
+function _openAuthPopup_(authUrl) {
+  var html = HtmlService.createHtmlOutput(
+    '<div style="font-family:Arial,sans-serif;padding:12px;">' +
+    '<p>Opening Google consent screen...</p>' +
+    '<p>If no new tab appears, allow popups and <a href="' + authUrl + '" target="_blank">click here</a>.</p>' +
+    '<script>window.open(' + JSON.stringify(authUrl) + ', "_blank");google.script.host.close();</script>' +
+    '</div>'
+  ).setWidth(420).setHeight(160);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Client Onboarding');
+}
 
-/**
- * Checks if the Cloud Function is accessible
- */
-function checkFunctionStatus() {
-  const ui = SpreadsheetApp.getUi();
-  
-  if (!CLOUD_FUNCTION_URL || CLOUD_FUNCTION_URL === 'YOUR_CLOUD_FUNCTION_URL_HERE') {
+function runClientOnboarding() {
+  var ui = SpreadsheetApp.getUi();
+  var cfg = getConfigValues_();
+
+  if (!cfg.channelId || !cfg.driveFolderId) {
     ui.alert(
-      '⚠️ Not Configured',
-      'Cloud Function URL is not configured.',
+      '❌ Missing configuration',
+      'Please set Config!B3 (YouTube Channel ID) and Config!B4 (Drive Root Folder ID) before onboarding.',
       ui.ButtonSet.OK
     );
     return;
   }
-  
+
+  var redeployPrompt = ui.alert(
+    'Redeploy uploader after onboarding?',
+    'Choose YES to request redeploy after secret rotation. Choose NO to skip redeploy and continue immediately.',
+    ui.ButtonSet.YES_NO
+  );
+  var redeployRequested = redeployPrompt === ui.Button.YES;
+
   try {
-    const options = {
-      method: 'get',
-      muteHttpExceptions: true
+    var payload = {
+      action: 'start_onboarding',
+      youtube_channel_id: cfg.channelId,
+      redeploy: redeployRequested,
+      trigger_upload: true,
+      upload_function_url: CLOUD_FUNCTION_URL,
+      upload_payload: {
+        drive_root_folder_id: cfg.driveFolderId,
+        youtube_channel_id: cfg.channelId,
+        default_video_description: cfg.defaultDescription,
+        post_upload_action: cfg.postUploadAction,
+        completed_folder_id: cfg.completedFolderId
+      }
     };
-    
-    const response = UrlFetchApp.fetch(CLOUD_FUNCTION_URL, options);
-    const statusCode = response.getResponseCode();
-    
-    if (statusCode === 200 || statusCode === 405) {
-      // 405 is okay - means function exists but doesn't accept GET
-      ui.alert(
-        '✅ Function is Accessible',
-        'The Cloud Function is deployed and accessible.\n\n' +
-        'URL: ' + CLOUD_FUNCTION_URL + '\n' +
-        'Status: Online',
-        ui.ButtonSet.OK
-      );
-    } else {
-      ui.alert(
-        '⚠️ Unexpected Response',
-        'Status Code: ' + statusCode + '\n\n' +
-        'The function may not be configured correctly.',
-        ui.ButtonSet.OK
-      );
+
+    var response = callCloudFunction_(ONBOARDING_FUNCTION_URL, payload);
+    var statusCode = response.getResponseCode();
+    var body = response.getContentText();
+
+    if (statusCode !== 200) {
+      ui.alert('Onboarding error', 'Status: ' + statusCode + '\n' + body.substring(0, 1200), ui.ButtonSet.OK);
+      return;
     }
-  } catch (error) {
+
+    var data = JSON.parse(body);
+    var authUrl = data.auth_url || '';
+    if (!authUrl) {
+      ui.alert('Onboarding error', 'No auth_url returned.\n' + body.substring(0, 1200), ui.ButtonSet.OK);
+      return;
+    }
+
+    _openAuthPopup_(authUrl);
     ui.alert(
-      '❌ Function Not Accessible',
-      'Could not reach the Cloud Function.\n\n' +
-      'Error: ' + error.message + '\n\n' +
-      'Please verify:\n' +
-      '1. The function is deployed\n' +
-      '2. The URL is correct\n' +
-      '3. The function allows unauthenticated access',
+      'Onboarding started',
+      'Complete the Google consent screen in the opened tab. Once approved, onboarding and upload continue automatically in the background.',
       ui.ButtonSet.OK
     );
-  }
-}
-
-/**
- * Prompts user to configure the Cloud Function URL
- */
-function promptForFunctionUrl() {
-  const ui = SpreadsheetApp.getUi();
-  
-  const result = ui.prompt(
-    '⚙️ Configure Cloud Function URL',
-    'Enter your Cloud Function URL:\n\n' +
-    'Example:\nhttps://us-east1-your-project.cloudfunctions.net/youtube-bulk-uploader\n\n' +
-    'Current URL: ' + CLOUD_FUNCTION_URL,
-    ui.ButtonSet.OK_CANCEL
-  );
-  
-  if (result.getSelectedButton() === ui.Button.OK) {
-    const newUrl = result.getResponseText().trim();
-    
-    if (newUrl && newUrl.startsWith('http')) {
-      // Store in Script Properties
-      PropertiesService.getScriptProperties().setProperty('FUNCTION_URL', newUrl);
-      
-      ui.alert(
-        '✅ Saved',
-        'Cloud Function URL has been configured.\n\n' +
-        'Note: For permanent configuration, update the CLOUD_FUNCTION_URL\n' +
-        'constant in the Apps Script code.',
-        ui.ButtonSet.OK
-      );
-    } else {
-      ui.alert(
-        '❌ Invalid URL',
-        'Please enter a valid HTTP/HTTPS URL.',
-        ui.ButtonSet.OK
-      );
-    }
-  }
-}
-
-/**
- * Shows help information
- */
-function showHelp() {
-  const ui = SpreadsheetApp.getUi();
-  
-  const helpText = 
-    '📚 YouTube Bulk Uploader Help\n\n' +
-    'This menu allows you to manually trigger video uploads to YouTube.\n\n' +
-    '🚀 Upload Videos Now\n' +
-    '   Triggers the upload process immediately\n\n' +
-    '📊 Check Function Status\n' +
-    '   Verifies the Cloud Function is accessible\n\n' +
-    '⚙️ Configure Function URL\n' +
-    '   Set or update the Cloud Function URL\n\n' +
-    'Configuration:\n' +
-    '• Spreadsheet ID: ' + SPREADSHEET.getId() + '\n' +
-    '• Drive Folder ID: ' + DRIVE_FOLDER_ID + '\n' +
-    '• YouTube Channel ID: ' + YOUTUBE_CHANNEL_ID + '\n\n' +
-    'For more information, visit the project README.';
-  
-  ui.alert('Help', helpText, ui.ButtonSet.OK);
-}
-
-/**
- * Refreshes the Logs sheet to show latest data
- */
-function refreshLogsSheet() {
-  try {
-    const logsSheet = SPREADSHEET.getSheetByName('Logs');
-    if (logsSheet) {
-      // Just trigger a recalculation by touching a cell
-      SpreadsheetApp.flush();
-    }
   } catch (error) {
-    Logger.log('Could not refresh logs sheet: ' + error);
+    Logger.log('runClientOnboarding error: ' + error);
+    ui.alert('Onboarding error', 'Failed to start onboarding.\n' + error.message, ui.ButtonSet.OK);
   }
 }
 
-/**
- * Gets the Cloud Function URL from script properties or constant
- */
-function getFunctionUrl() {
-  const storedUrl = PropertiesService.getScriptProperties().getProperty('FUNCTION_URL');
-  return storedUrl || CLOUD_FUNCTION_URL;
+function completeClientOnboarding() {
+  var ui = SpreadsheetApp.getUi();
+  ui.alert(
+    'Deprecated step',
+    'Manual completion is no longer required. Use "Client Onboarding (One Click)" and complete OAuth consent in the popup tab.',
+    ui.ButtonSet.OK
+  );
 }
 
-// ============================================================================
-// ADVANCED: Time-based Trigger Setup
-// ============================================================================
+function traverseSubFolders(parent, list) {
+  parent = parent.getId();
+  var childFolder = DriveApp.getFolderById(parent).getFolders();
+  while(childFolder.hasNext()) {
+    var child = childFolder.next();
+    addFilesToList(child, list);
+    //Logger.log(child.getName() + " " + child.getId());
+    traverseSubFolders(child, list);
+  }
+  return;
+}
 
-/**
- * Creates a time-based trigger to run uploads automatically
- * Run this function once to set up automatic uploads
- */
-function createDailyTrigger() {
-  // Delete existing triggers first
-  const triggers = ScriptApp.getProjectTriggers();
-  triggers.forEach(trigger => {
-    if (trigger.getHandlerFunction() === 'triggerUpload') {
-      ScriptApp.deleteTrigger(trigger);
+function addFilesToList(fromFolder, list) {
+  var files = fromFolder.getFiles();
+    while (files.hasNext()) {
+    var file = files.next();
+    var fileName = file.getName().toLowerCase();
+    if(fileName.indexOf(".mp4") > -1 || fileName.indexOf(".mov") > -1 || fileName.indexOf(".avi") > -1) //if file is a video
+      list.push([fromFolder.getName(), fromFolder.getId(), file.getName(), file.getId()]);
+  }
+}
+
+function pullFilesFromRootFolder()
+{
+  var folderList = [];
+  var rootFolderId = SpreadsheetApp.getActive().getRange("Config!B4").getValue();
+  folderList = traverseDriveFolderforSubFolders(rootFolderId, folderList);
+  folderList.push(rootFolderId);
+
+  var searchString = "(parents in '";
+  var sheet = SpreadsheetApp.getActive().getSheetByName("File Upload List");
+  var valuesForSheet = []; //File array to be written to sheet in the end
+  valuesForSheet.push(FILE_UPLOAD_LIST_SHEET_HEADER);
+
+  for(var i in folderList){
+    var folderID = folderList[i];
+    Logger.log("folderID: " + folderID);
+    if(i == folderList.length-1){
+      searchString = searchString + folderID;
     }
-  });
-  
-  // Create new daily trigger at 1 AM
-  ScriptApp.newTrigger('triggerUpload')
-    .timeBased()
-    .atHour(1)
-    .everyDays(1)
-    .create();
-  
-  SpreadsheetApp.getUi().alert(
-    '✅ Trigger Created',
-    'A daily trigger has been set up to run uploads at 1 AM.',
-    SpreadsheetApp.getUi().ButtonSet.OK
-  );
+    else {
+      searchString = searchString + folderID + "' or parents in '";
+    }
+  }
+
+  searchString = searchString + "') and (title contains '.mp4' or title contains '.mov' or title contains '.avi')";
+
+  Logger.log(searchString);
+  var files = DriveApp.searchFiles(searchString);
+
+  while (files.hasNext()) {
+    var file = files.next();
+    valuesForSheet.push([file.getName(), file.getId(), "", "", "", "", ""]);
+  }
+
+  sheet.clearContents();
+  var lastRow = sheet.getLastRow();
+  var range = sheet.getRange(lastRow + 1, 1, valuesForSheet.length, 7);
+  range.setValues(valuesForSheet);
 }
 
-/**
- * Removes all time-based triggers
- */
-function removeAllTriggers() {
-  const triggers = ScriptApp.getProjectTriggers();
-  triggers.forEach(trigger => {
-    ScriptApp.deleteTrigger(trigger);
-  });
-  
-  SpreadsheetApp.getUi().alert(
-    '✅ Triggers Removed',
-    'All automatic triggers have been removed.',
-    SpreadsheetApp.getUi().ButtonSet.OK
-  );
+function traverseDriveFolderforSubFolders (rootFolderId, folderList) {
+  var parentFolder = DriveApp.getFolderById(rootFolderId);
+  var childFolders = parentFolder.getFolders();
+  while(childFolders.hasNext()) {
+    var child = childFolders.next();
+    folderList.push(child.getId());
+    folderList = traverseDriveFolderforSubFolders(child.getId(), folderList);
+  }
+
+  return folderList;
 }
