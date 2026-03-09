@@ -20,6 +20,7 @@ import io
 import random
 import json
 import functions_framework
+from onboarding import onboarding as onboarding_handler
 from dataclasses import dataclass, asdict
 from typing import TypedDict, Required, NotRequired, Literal
 from datetime import datetime
@@ -32,6 +33,7 @@ from googleapiclient.discovery import build
 import logging
 
 CONFIG_RANGE = 'Config!A:B'
+UPLOAD_LIST_RANGE = 'File Upload List!A2:G'
 SERVICE_PARAMS = {
     'Drive': {
         'serviceName': 'drive',
@@ -357,6 +359,57 @@ def _append_log_entry(sheets_service, log_entry, config: Config):
     logging.error('An error occurred while appending to the Logs sheet: %s', e)
 
 
+def _parse_optional_bool(value):
+  """Parses a boolean-ish value; returns None when empty or invalid."""
+  if value is None:
+    return None
+
+  normalized = str(value).strip().lower()
+  if not normalized:
+    return None
+  if normalized in ('true', '1', 'yes', 'y'):
+    return True
+  if normalized in ('false', '0', 'no', 'n'):
+    return False
+  return None
+
+
+def _get_upload_list_metadata(sheets_service, spreadsheet_id):
+  """Gets per-file metadata from 'File Upload List' sheet keyed by file ID."""
+  metadata_by_file_id = {}
+  if not spreadsheet_id:
+    return metadata_by_file_id
+
+  try:
+    request = sheets_service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id, range=UPLOAD_LIST_RANGE)
+    response = request.execute()
+
+    for row in response.get('values', []):
+      if len(row) < 2:
+        continue
+
+      file_id = str(row[1]).strip()
+      if not file_id:
+        continue
+
+      title = str(row[2]).strip() if len(row) > 2 else ''
+      description = str(row[3]).strip() if len(row) > 3 else ''
+      tags = str(row[4]).strip() if len(row) > 4 else ''
+      made_for_kids = _parse_optional_bool(row[5]) if len(row) > 5 else None
+
+      metadata_by_file_id[file_id] = {
+          'title': title,
+          'description': description,
+          'tags': tags,
+          'made_for_kids': made_for_kids
+      }
+  except HttpError as e:
+    logging.warning('Could not read File Upload List metadata. Error: %s', e)
+
+  return metadata_by_file_id
+
+
 def _log_upload_to_sheet(sheets_service, config: Config, video_details):
   """Logs the details of a successful upload to the spreadsheet."""
   if not config.spreadsheet_id:
@@ -418,6 +471,31 @@ def get_youtube_videos(youtube_service, channel_id):
   except HttpError as e:
     logging.error('An error occurred fetching YouTube videos: %s', e)
   return videos
+
+
+def _validate_authenticated_channel(youtube_service, expected_channel_id):
+  """Validates that OAuth credentials point to the expected channel."""
+  if not expected_channel_id:
+    return
+
+  try:
+    response = youtube_service.channels().list(part='id', mine=True).execute()
+  except HttpError as e:
+    logging.error('Could not verify authenticated YouTube channel: %s', e)
+    raise ValueError('Failed to verify authenticated YouTube channel.') from e
+
+  items = response.get('items', [])
+  if not items:
+    raise ValueError(
+        'No channel found for authenticated credentials. Cannot continue upload.'
+    )
+
+  authenticated_channel_id = items[0].get('id')
+  if authenticated_channel_id != expected_channel_id:
+    raise ValueError(
+        'Authenticated channel does not match requested youtube_channel_id. '
+        f'Authenticated: {authenticated_channel_id}, Requested: {expected_channel_id}'
+    )
 
 
 def recursive_drive_search(drive_service, folder_id,
@@ -593,6 +671,8 @@ def main(request):
   if config.fetch_labels:
     drivelabels_service = get_service('DriveLabels', creds)
 
+  _validate_authenticated_channel(youtube_service, config.youtube_channel_id)
+
   if not config.drive_root_folder_id:
     raise ValueError('Error: "Drive Root Folder Id" setting is not set.')
 
@@ -616,6 +696,11 @@ def main(request):
                                         list(drive_labels.keys()))
   logging.info('Found %s video files in Google Drive.', len(drive_videos))
   logging.debug(drive_videos)
+
+  upload_list_metadata = _get_upload_list_metadata(sheets_service,
+                                                   config.spreadsheet_id)
+  logging.info('Loaded metadata rows from File Upload List: %s',
+               len(upload_list_metadata))
 
   # 5. Determine which videos are new
   videos_to_upload: list[DriveFile] = []
@@ -649,6 +734,13 @@ def main(request):
     # Get metadata or use defaults
     title = title_without_ext
     description = video.get('description') or config.default_video_description
+
+    per_file_metadata = upload_list_metadata.get(file_id, {})
+    if per_file_metadata.get('title'):
+      title = per_file_metadata['title']
+    if per_file_metadata.get('description'):
+      description = per_file_metadata['description']
+
     # Get tags from file properties
     tags_from_properties = list(video.get('properties', {}).keys())
 
@@ -663,8 +755,14 @@ def main(request):
 
     all_tags = tags_from_properties + tags_from_labels
     tags = ','.join(all_tags)
-    made_for_kids = video.get('properties', {}).get('madeForKids',
-                                                    'FALSE').upper() == 'TRUE'
+    if per_file_metadata.get('tags'):
+      tags = per_file_metadata['tags']
+    made_for_kids = per_file_metadata.get('made_for_kids')
+    if made_for_kids is None:
+      made_for_kids = _parse_optional_bool(
+          video.get('properties', {}).get('madeForKids'))
+    if made_for_kids is None:
+      made_for_kids = False
 
     body = {
         'snippet': {
@@ -720,3 +818,8 @@ def main(request):
       'files': list(drive_videos)
   }
   return result, 200
+
+
+def onboarding(request):
+  """Delegates onboarding requests to the onboarding handler."""
+  return onboarding_handler(request)
