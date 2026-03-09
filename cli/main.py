@@ -27,7 +27,7 @@ import google_auth_oauthlib.flow
 from google.auth.transport.requests import Request
 from urllib import parse
 
-SPREADSHEET_ID = ''  # Insert your spreadsheet ID here
+SPREADSHEET_ID = '1VYYuowVbcYmWNW_LdDKlz6VRbxbb5_8J7C3cFV9zDpQ'  # Insert your spreadsheet ID here
 CREDENTIALS_JSON_FILE_NAME = 'yt_credentials.json'
 CONFIG_RANGE = 'Config!A1:B3'
 UPLOAD_LIST_RANGE = 'File Upload List!A2:F101'  # Max 100 uploads at a time
@@ -92,7 +92,7 @@ def main():
   response = drive_service.files().list(
       # pylint: disable=no-member
       q="mimeType='application/vnd.google-apps.folder' "
-        "and name='YTBU - Completed Uploads'",
+        "and name='videos_completed_uploaded'",
       spaces='drive',
       fields='nextPageToken, files(id, name)',
       pageToken=page_token).execute()
@@ -286,31 +286,9 @@ def get_credentials(service_name):
     if creds and creds.expired and creds.refresh_token:
       creds.refresh(Request())
     else:
-      flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
+      flow = google_auth_oauthlib.flow.InstalledAppFlow.from_client_secrets_file(
           CREDENTIALS_JSON_FILE_NAME, scopes=scopes)
-      flow.redirect_uri = 'https://developers.google.com/oauthplayground'
-      authorization_url, _ = flow.authorization_url(
-          # Enable offline access so that you can refresh an access token
-          # without re-prompting the user for permission.
-          # Recommended for web server apps
-          access_type='offline',
-          # Enable incremental authorization. Recommended as a best practice.
-          include_granted_scopes='true',
-          prompt='consent')
-      print('\n-----------------------------------------------------------')
-      print(f'{service_name} authentication:')
-      print('\n-----------------------------------------------------------')
-      print('Click on the following URL and login '
-            f'with your Google account: \n{authorization_url}\n')
-      print('-----------------------------------------------------------')
-      print('After approving you will encounter ERR_CONNECTION_REFUSED'
-            ' - This is expected.')
-      print('Copy and paste the full URL from your browsers address bar.')
-      url = input('URL: ').strip()
-      code = parse.parse_qs(parse.urlparse(url).query)['code'][0]
-      os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
-      flow.fetch_token(code=code)
-      creds = flow.credentials
+      creds = flow.run_local_server(port=0)
       # Save the credentials for the next run
       with open(pickle_credentials_file_name, 'wb') as token:
         pickle.dump(creds, token)
